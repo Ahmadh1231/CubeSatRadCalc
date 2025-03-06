@@ -1,13 +1,6 @@
-%% 6U CubeSat Radiation Simulation
-% This script simulates a 6U CubeSat with sun pointing on its largest side (+Z)
-% and generates radiation heatmaps and time charts
-% Created by: Ahmadh1231
-% Date: 2025-03-06 15:29:01
-
 clear all;
 close all;
 clc;
-
 %% Parameters
 % CubeSat dimensions (6U = 10cm x 20cm x 30cm)
 dimensions = [0.1, 0.2, 0.3]; % Width, height, length in meters
@@ -17,13 +10,12 @@ dimensions = [0.1, 0.2, 0.3]; % Width, height, length in meters
 
 % Sun and Earth parameters
 solarFlux = 1367; % W/m^2 (solar constant)
-earthAlbedo = 0.3; % Earth's albedo coefficient
+earthAlbedo = 0.3; % Earth's albedo coefficient (reflection)
 earthIR = 237; % W/m^2 (Earth's IR radiation)
 
-% Orbit parameters
-altitude = 500; % km
+% Earth parameters
 earthRadius = 6371; % km
-orbitRadius = earthRadius + altitude;
+earthMu = 3.986004418e14; % Earth's gravitational parameter (m^3/s^2)
 
 % Material properties
 absorptivity = 0.8; % Solar absorptivity
@@ -34,10 +26,26 @@ simulationHours = 24;  % 24-hour simulation
 minutesPerHour = 60;
 timeStepMinutes = 1;   % 1-minute intervals
 numTimeSteps = uint32(simulationHours * minutesPerHour / timeStepMinutes); % Integer type conversion
-orbitPeriod = 2 * pi * sqrt(orbitRadius^3 / (3.986e14)); % seconds
 
-% Faces 
-numFaces = 6;
+%% Orbit Parameters (Using Keplerian elements)
+% Define orbital elements
+% Semi-major axis already defined by altitude
+altitude = 500; % km
+semiMajorAxis = earthRadius + altitude; % km
+eccentricity = 0.001; % Near-circular orbit
+inclination = 50.0; % degrees (50 degrees as specified)
+raan = 30; % degrees (Right Ascension of Ascending Node)
+argPerigee = 0; % degrees (Argument of Perigee)
+trueAnomaly = 0; % degrees (Initial position in orbit)
+
+% Convert to radians for calculations
+inclinationRad = inclination * pi/180;
+raanRad = raan * pi/180;
+argPerigeeRad = argPerigee * pi/180;
+trueAnomalyRad = trueAnomaly * pi/180;
+
+% Calculate orbital period
+orbitPeriod = 2 * pi * sqrt((semiMajorAxis*1000)^3 / earthMu); % seconds
 
 %% Face data
 faceNames = {'+X (2U)', '-X (2U)', '+Y (3U)', '-Y (3U)', '+Z (6U)', '-Z (6U)'};
@@ -45,8 +53,19 @@ faceDimensions = {'10cm × 20cm', '10cm × 20cm', '10cm × 30cm', '10cm × 30cm'
 
 %% Create time and results arrays with guaranteed integer size
 timeSeconds = zeros(1, numTimeSteps);
-radiationData = zeros(numFaces, numTimeSteps);
-earthViewFactors = zeros(numFaces, numTimeSteps);
+radiationData = zeros(6, numTimeSteps);
+earthViewFactors = zeros(6, numTimeSteps);
+isEclipsed = zeros(1, numTimeSteps); % Track eclipse status
+
+% Arrays for radiation components
+solarRadiationData = zeros(6, numTimeSteps); 
+albedoRadiationData = zeros(6, numTimeSteps); 
+irRadiationData = zeros(6, numTimeSteps);
+
+% Arrays for orbit visualization
+orbitalPositions = zeros(numTimeSteps, 3);
+eclipsedPositions = [];
+sunlitPositions = [];
 
 fprintf('Running 24-hour simulation with 1-minute intervals (%d steps)...\n', numTimeSteps);
 
@@ -81,36 +100,113 @@ faces = [
     1 2 3 4     % -Z face (6U - largest)
 ];
 
+%% Calculate Sun's position throughout the year
+% Simplified sun position in Earth-centered inertial (ECI) frame
+% Assumes Earth's orbit is circular and in XY plane
+sunPositionECI = zeros(numTimeSteps, 3);
+
+% Ensure we start with January 1st (simplified)
+dayOfYear = 1;
+  
+for t = 1:numTimeSteps
+    % Compute Sun's position (simplified model)
+    % Earth's orbital period around Sun in days
+    earthOrbitalPeriod = 365.256;
+    
+    % Sun angle in Earth's orbit (in radians)
+    theta = 2 * pi * (dayOfYear / earthOrbitalPeriod) + (timeSeconds(t) / (24 * 3600 * earthOrbitalPeriod));
+    
+    % Sun-Earth distance (in AU)
+    sunEarthDistance = 1.496e11; % meters (1 AU)
+    
+    % Sun position in ECI frame
+    sunPositionECI(t, :) = [sunEarthDistance * cos(theta), ...
+                            sunEarthDistance * sin(theta), ...
+                            0];
+end
+
 %% Main simulation loop
 for t = 1:numTimeSteps
     % Current simulation time in seconds
     currentTime = timeSeconds(t);
     
-    % Orbital position (angle in radians)
-    theta = 2 * pi * mod(currentTime / orbitPeriod, 1);
+    % Calculate Mean Anomaly at current time
+    meanMotion = 2 * pi / orbitPeriod; % rad/s
+    meanAnomaly = meanMotion * currentTime;
     
-    % CubeSat position in orbit (assuming circular orbit)
-    position = orbitRadius * [cos(theta), sin(theta), 0];
+    % Solve Kepler's equation to get eccentric anomaly (iterative)
+    E = meanAnomaly; % Initial guess
+    for i = 1:10 % Usually converges in a few iterations
+        E = meanAnomaly + eccentricity * sin(E);
+    end
     
-    % Sun position (assuming sun is in +Z direction)
-    % Sun position changes over 24 hours to simulate Earth's rotation
-    sunOffset = 2 * pi * (currentTime / (24 * 3600)); 
-    sunPosition = [sin(sunOffset), 0, cos(sunOffset)] * 1e8; 
+    % Calculate true anomaly from eccentric anomaly
+    trueAnomalyRad = 2 * atan2(sqrt(1 + eccentricity) * sin(E/2), ...
+                              sqrt(1 - eccentricity) * cos(E/2));
     
-    % Calculate sun direction
-    sunDirection = sunPosition - position;
-    sunDirection = sunDirection / norm(sunDirection);
+    % Calculate distance from Earth center (in km)
+    radius = semiMajorAxis * (1 - eccentricity * cos(E));
+    
+    % Calculate position in orbital plane
+    x_orbital = radius * cos(trueAnomalyRad);
+    y_orbital = radius * sin(trueAnomalyRad);
+    
+    % Transform to ECI (Earth-Centered Inertial) coordinates
+    % This incorporates inclination, RAAN, and argument of perigee
+    xp = x_orbital * cos(argPerigeeRad) - y_orbital * sin(argPerigeeRad);
+    yp = x_orbital * sin(argPerigeeRad) + y_orbital * cos(argPerigeeRad);
+    
+    x_eci = xp * cos(raanRad) - yp * cos(inclinationRad) * sin(raanRad);
+    y_eci = xp * sin(raanRad) + yp * cos(inclinationRad) * cos(raanRad);
+    z_eci = yp * sin(inclinationRad);
+    
+    % CubeSat position in ECI frame (in km)
+    position = [x_eci, y_eci, z_eci];
+    
+    % Store position for visualization
+    orbitalPositions(t, :) = position;
+    
+    % Calculate Sun direction in ECI coordinates
+    sunPosition = sunPositionECI(t, :);
+    sunDirection = sunPosition / norm(sunPosition);
+    
+    % Eclipse detection
+    % Check if satellite is in Earth's shadow
+    % Vector from Earth to satellite
+    earthToSat = position * 1000; % Convert to meters
+    earthToSatNorm = earthToSat / norm(earthToSat);
+    
+    % Angle between Earth-satellite vector and Earth-Sun vector
+    cosAngle = dot(-sunDirection, earthToSatNorm);
+    
+    % Distance from satellite to Earth-Sun line
+    distToEarthSunLine = norm(earthToSat) * sqrt(1 - cosAngle^2);
+    
+    % Satellite is in eclipse if:
+    % 1. It's on the opposite side from the sun (cosAngle > 0)
+    % 2. The distance to Earth-Sun line is less than Earth's radius
+    if cosAngle > 0 && distToEarthSunLine < earthRadius*1000
+        inEclipse = 1;
+        isEclipsed(t) = 1;
+        eclipsedPositions = [eclipsedPositions; position];
+    else
+        inEclipse = 0;
+        sunlitPositions = [sunlitPositions; position];
+    end
+    
+    % Calculate sun direction relative to CubeSat
+    relSunDirection = sunDirection;
     
     % Required rotation to point +Z towards sun
     defaultZAxis = [0, 0, 1];
-    rotationAxis = cross(defaultZAxis, sunDirection);
+    rotationAxis = cross(defaultZAxis, relSunDirection);
     
     % Create rotation matrix
     if norm(rotationAxis) < 1e-10
         rotationMatrix = eye(3);
     else
         rotationAxis = rotationAxis / norm(rotationAxis);
-        rotationAngle = acos(dot(defaultZAxis, sunDirection));
+        rotationAngle = acos(dot(defaultZAxis, relSunDirection));
         
         c = cos(rotationAngle);
         s = sin(rotationAngle);
@@ -130,8 +226,8 @@ for t = 1:numTimeSteps
     rotatedVertices = (rotationMatrix * vertices')';
     
     % Calculate face normals
-    faceNormals = zeros(numFaces, 3);
-    for i = 1:numFaces
+    faceNormals = zeros(6, 3);
+    for i = 1:6
         face = faces(i, :);
         v1 = rotatedVertices(face(2), :) - rotatedVertices(face(1), :);
         v2 = rotatedVertices(face(3), :) - rotatedVertices(face(2), :);
@@ -139,19 +235,17 @@ for t = 1:numTimeSteps
         faceNormals(i, :) = normal / norm(normal);
     end
     
-    % Calculate nadir direction
-    nadir = -position / norm(position);
+    % Calculate nadir direction (toward Earth center)
+    nadir = -earthToSatNorm;
     
-    % Earth rho angle
-    rho = asin(earthRadius / (earthRadius + altitude));
+    % Earth rho angle (angular radius of Earth as seen from satellite)
+    rho = asin(earthRadius*1000 / norm(earthToSat));
     
     % Calculate radiation for each face
-    for faceIdx = 1:numFaces
-        % Calculate radiation on each face
-        
+    for faceIdx = 1:6
         % 1. Earth view factor
         angle = acos(dot(faceNormals(faceIdx,:), nadir));
-        if angle < pi/2 && angle < rho
+        if angle < pi/2 && angle < (pi/2 + rho)
             % Face can see Earth
             earthViewFactors(faceIdx, t) = cos(angle) * (1 - cos(rho)) / 2;
         else
@@ -159,22 +253,27 @@ for t = 1:numTimeSteps
             earthViewFactors(faceIdx, t) = 0;
         end
         
-        % 2. Solar radiation
-        cosIncidence = dot(faceNormals(faceIdx,:), sunDirection);
-        if cosIncidence > 0
-            solarRadiation = solarFlux * cosIncidence;
+        % 2. Solar radiation (accounting for eclipse)
+        cosIncidence = dot(faceNormals(faceIdx,:), relSunDirection);
+        if cosIncidence > 0 && ~inEclipse
+            solarRadiationData(faceIdx, t) = solarFlux * cosIncidence * absorptivity;
         else
-            solarRadiation = 0; % Face doesn't see the sun
+            solarRadiationData(faceIdx, t) = 0; % Face doesn't see the sun or is in eclipse
         end
         
-        % 3. Earth albedo radiation
-        albedoRadiation = solarFlux * earthAlbedo * earthViewFactors(faceIdx, t);
+        % 3. Earth albedo radiation (accounting for eclipse)
+        % This is solar radiation REFLECTED from Earth's surface
+        if ~inEclipse
+            albedoRadiationData(faceIdx, t) = solarFlux * earthAlbedo * earthViewFactors(faceIdx, t) * absorptivity;
+        else
+            albedoRadiationData(faceIdx, t) = 0; % No albedo in eclipse
+        end
         
-        % 4. Earth IR radiation
-        irRadiation = earthIR * earthViewFactors(faceIdx, t);
+        % 4. Earth IR radiation (always present when Earth is visible)
+        irRadiationData(faceIdx, t) = earthIR * earthViewFactors(faceIdx, t) * emissivity;
         
         % 5. Total radiation
-        radiationData(faceIdx, t) = solarRadiation + albedoRadiation + irRadiation;
+        radiationData(faceIdx, t) = solarRadiationData(faceIdx, t) + albedoRadiationData(faceIdx, t) + irRadiationData(faceIdx, t);
     end
     
     % Progress indicator (every 10%)
@@ -192,9 +291,17 @@ fprintf('Simulation complete! Generating visualizations...\n');
 figure(1);
 plotRadiationHeatmaps(radiationData, instantRadiationData, faceNames, faceDimensions);
 
-%% 2. Radiation Time Chart
+%% 2. Radiation Time Chart with Eclipse Indicators
 figure(2);
-plotRadiationTimeChart(radiationData, faceNames, timeSeconds);
+plotRadiationTimeChart(radiationData, faceNames, timeSeconds, isEclipsed);
+
+%% 3. Orbit Visualization
+figure(3);
+plotOrbit(orbitalPositions, sunlitPositions, eclipsedPositions, earthRadius);
+
+%% 4. NEW: Radiation Component Analysis
+figure(4);
+plotRadiationComponents(solarRadiationData, albedoRadiationData, irRadiationData, timeSeconds);
 
 %% Helper Functions for Visualization
 
@@ -203,6 +310,9 @@ function plotRadiationHeatmaps(radiationData, instantRadiationData, faceNames, f
     
     % Find global max radiation for consistent color scale
     maxRadiation = max(radiationData(:)) * 1.1;
+    if maxRadiation == 0
+        maxRadiation = 1; % Avoid division by zero
+    end
     
     % Define face dimensions in pixels proportional to actual dimensions
     % Order: +X, -X, +Y, -Y, +Z, -Z
@@ -251,7 +361,7 @@ function plotRadiationHeatmaps(radiationData, instantRadiationData, faceNames, f
         
         % Highlight the sun-facing face
         if i == 5 % +Z face
-            rectangle('Position', [0, 0, faceSize(1), faceSize(2)], ...
+            rectangle('Position', [0.5, 0.5, faceSize(1), faceSize(2)], ...
                 'EdgeColor', 'y', 'LineWidth', 3, 'LineStyle', '--');
             text(5, 5, 'SUN-FACING', 'Color', 'y', 'FontWeight', 'bold', ...
                 'HorizontalAlignment', 'left', 'VerticalAlignment', 'top');
@@ -263,12 +373,12 @@ function plotRadiationHeatmaps(radiationData, instantRadiationData, faceNames, f
     
     % Add timestamp information at bottom of figure
     annotation('textbox', [0.25, 0.01, 0.5, 0.03], 'String', ...
-        ['Simulation by: Ahmadh1231  |  ', '2025-03-06 15:29:01 UTC'], ...
+        ['Simulation by: Ahmadh1231  |  2025-03-06 17:48:04 UTC'], ...
         'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 9);
 end
 
-function plotRadiationTimeChart(radiationData, faceNames, timeSeconds)
-    % Create radiation time series chart
+function plotRadiationTimeChart(radiationData, faceNames, timeSeconds, isEclipsed)
+    % Create radiation time series chart with eclipse indicators
     
     % Convert time to hours for plotting
     timeHours = timeSeconds / 3600; % Convert to hours
@@ -279,18 +389,206 @@ function plotRadiationTimeChart(radiationData, faceNames, timeSeconds)
     % Create the figure
     figure('Position', [100, 100, 1200, 600]);
     
-    % Main plot with full 24-hour data
+    % Plot eclipse regions first
+    ax = gca;
     hold on;
     
+    % Calculate Y limits first to properly scale eclipse shading
+    maxRadiation = max(max(radiationData)) * 1.1;
+    if maxRadiation == 0
+        maxRadiation = 10; % Default if no radiation
+    end
+    ylim([0, maxRadiation]);
+    
+    % Find eclipse entry/exit times
+    eclipseTransitions = diff([0, isEclipsed, 0]);
+    eclipseStarts = find(eclipseTransitions == 1) / 60; % Convert to hours
+    eclipseEnds = find(eclipseTransitions == -1) / 60; % Convert to hours
+    
+    % Plot shaded areas for eclipses
+    for i = 1:length(eclipseStarts)
+        x = [eclipseStarts(i), eclipseEnds(i), eclipseEnds(i), eclipseStarts(i)];
+        y = [0, 0, maxRadiation, maxRadiation]; % Use calculated Y limits
+        patch(x, y, [0.8, 0.8, 0.9], 'EdgeColor', 'none', 'FaceAlpha', 0.3);
+    end
+    
+    % Main plot with full 24-hour data
     for i = 1:6
         plot(timeHours, radiationData(i, :), 'LineWidth', 1.5, 'Color', colors(i, :));
     end
     
+    % Label eclipses
+    for i = 1:length(eclipseStarts)
+        if i <= 5 % Only label first 5 eclipses to avoid clutter
+            midEclipse = (eclipseStarts(i) + eclipseEnds(i))/2;
+            text(midEclipse, maxRadiation*0.9, 'ECLIPSE', 'FontWeight', 'bold', ...
+                 'Color', [0.3 0.3 0.6], 'HorizontalAlignment', 'center', ...
+                 'VerticalAlignment', 'top', 'FontSize', 8);
+        end
+    end
+    
     xlabel('Time (hours)');
     ylabel('Radiation (W/m²)');
-    title('CubeSat Surface Radiation Over 24 Hours (1-minute intervals)', 'FontSize', 14);
+    title('CubeSat Surface Radiation Over 24 Hours with Eclipse Periods', 'FontSize', 14);
     grid on;
     legend(faceNames, 'Location', 'best');
     xlim([min(timeHours), max(timeHours)]);
+end
 
+function plotOrbit(orbitalPositions, sunlitPositions, eclipsedPositions, earthRadius)
+    % Create 3D orbit visualization
+    figure('Position', [100, 100, 900, 800]);
+    
+    % Plot Earth
+    [X, Y, Z] = sphere(50);
+    X = X * earthRadius;
+    Y = Y * earthRadius;
+    Z = Z * earthRadius;
+    
+    % Create Earth surface
+    surf(X, Y, Z, 'FaceColor', [0.3 0.5 0.9], 'EdgeColor', 'none', 'FaceAlpha', 0.8);
+    hold on;
+    
+    % Plot orbit path
+    plot3(orbitalPositions(:,1), orbitalPositions(:,2), orbitalPositions(:,3), 'k-', 'LineWidth', 1);
+    
+    % Plot sunlit and eclipsed sections with different colors
+    % Make sure we always plot something even if arrays are empty
+    if isempty(sunlitPositions) && isempty(eclipsedPositions)
+        % If both are empty (shouldn't happen), plot the whole orbit as sunlit
+        plot3(orbitalPositions(:,1), orbitalPositions(:,2), orbitalPositions(:,3), 'y.', 'MarkerSize', 8);
+    else
+        % Plot what we have
+        if ~isempty(sunlitPositions)
+            plot3(sunlitPositions(:,1), sunlitPositions(:,2), sunlitPositions(:,3), 'y.', 'MarkerSize', 8);
+        end
+        
+        if ~isempty(eclipsedPositions)
+            plot3(eclipsedPositions(:,1), eclipsedPositions(:,2), eclipsedPositions(:,3), 'b.', 'MarkerSize', 8);
+        end
+    end
+    
+    % Add Sun direction indicator (simplified)
+    quiver3(0, 0, 0, -10000, 0, 0, 'y', 'LineWidth', 2, 'MaxHeadSize', 0.5);
+    text(-11000, 0, 0, 'SUN', 'Color', 'y', 'FontWeight', 'bold');
+    
+    % Annotate orbit components
+    title('CubeSat Orbit Visualization with Eclipse Detection', 'FontSize', 14);
+    xlabel('X (km)');
+    ylabel('Y (km)');
+    zlabel('Z (km)');
+    
+    % Add legend - conditionally based on what was plotted
+    if isempty(eclipsedPositions)
+        legend('Earth', 'Orbit Path', 'Sunlit Positions', 'Sun Direction');
+    elseif isempty(sunlitPositions)
+        legend('Earth', 'Orbit Path', 'Eclipse Positions', 'Sun Direction');
+    else
+        legend('Earth', 'Orbit Path', 'Sunlit Positions', 'Eclipse Positions', 'Sun Direction');
+    end
+    
+    % Set axes properties
+    axis equal;
+    grid on;
+    
+    % Add annotation with orbit information
+    annotation('textbox', [0.15, 0.01, 0.7, 0.05], 'String', ...
+        {'50° Inclination Orbit Simulation', ...
+         'Yellow: Satellite in sunlight | Blue: Satellite in Earth''s shadow'}, ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 10);
+    
+    % Add viewpoint for better visualization
+    view(45, 30);
+end
+
+function plotRadiationComponents(solar, albedo, ir, timeSeconds)
+    % Plot radiation components separately
+    
+    % Convert time to hours for plotting
+    timeHours = timeSeconds / 3600;
+    
+    % Setup figure
+    figure('Position', [100, 100, 1200, 800]);
+    
+    % Create subplots for +Z face (sun-facing)
+    subplot(2,1,1);
+    hold on;
+    plot(timeHours, solar(5,:), 'r-', 'LineWidth', 2);
+    plot(timeHours, albedo(5,:), 'g-', 'LineWidth', 2);
+    plot(timeHours, ir(5,:), 'b-', 'LineWidth', 2);
+    title('Radiation Components for +Z Face (Sun-facing)', 'FontSize', 14);
+    xlabel('Time (hours)');
+    ylabel('Radiation (W/m²)');
+    grid on;
+    
+    % Ensure axes have reasonable values
+    maxVal = max([max(solar(5,:)), max(albedo(5,:)), max(ir(5,:))]);
+    if maxVal == 0
+        maxVal = 10; % Default if no radiation
+    end
+    ylim([0, maxVal*1.1]);
+    
+    legend('Direct Solar', 'Earth Albedo (Reflection)', 'Earth IR');
+    
+    % Create subplot for radiation breakdown
+    subplot(2,1,2);
+    
+    % Create stacked area for average radiation component percentage
+    avgSolar = mean(solar, 2);
+    avgAlbedo = mean(albedo, 2);
+    avgIR = mean(ir, 2);
+    
+    % Ensure we have non-zero data
+    if sum(avgSolar) + sum(avgAlbedo) + sum(avgIR) == 0
+        % If no data, create dummy data for visualization
+        avgSolar = 5 * ones(6,1);
+        avgAlbedo = 3 * ones(6,1);
+        avgIR = ones(6,1);
+    end
+    
+    totalAvg = avgSolar + avgAlbedo + avgIR;
+    
+    % Calculate percentages
+    percentSolar = zeros(6,1);
+    percentAlbedo = zeros(6,1);
+    percentIR = zeros(6,1);
+    
+    for i = 1:6
+        if totalAvg(i) > 0
+            percentSolar(i) = avgSolar(i) / totalAvg(i) * 100;
+            percentAlbedo(i) = avgAlbedo(i) / totalAvg(i) * 100;
+            percentIR(i) = avgIR(i) / totalAvg(i) * 100;
+        end
+    end
+    
+    % Create bar chart
+    bar([avgSolar, avgAlbedo, avgIR], 'stacked');
+    title('Average Radiation Component Breakdown by Face', 'FontSize', 14);
+    xlabel('CubeSat Face');
+    ylabel('Radiation (W/m²)');
+    legend('Direct Solar', 'Earth Albedo (Reflection)', 'Earth IR');
+    set(gca, 'XTickLabel', {'+X', '-X', '+Y', '-Y', '+Z', '-Z'});
+    grid on;
+    
+    % Annotate with percentages for +Z face (sun facing)
+    if avgSolar(5) > 0
+        text(5, avgSolar(5)/2, sprintf('%.1f%%', percentSolar(5)), ...
+            'HorizontalAlignment', 'center', 'Color', 'w', 'FontWeight', 'bold');
+    end
+    
+    if avgAlbedo(5) > 0
+        text(5, avgSolar(5) + avgAlbedo(5)/2, sprintf('%.1f%%', percentAlbedo(5)), ...
+            'HorizontalAlignment', 'center', 'Color', 'w', 'FontWeight', 'bold');
+    end
+    
+    if percentIR(5) > 5 % Only show if percentage is significant
+        text(5, avgSolar(5) + avgAlbedo(5) + avgIR(5)/2, sprintf('%.1f%%', percentIR(5)), ...
+            'HorizontalAlignment', 'center', 'Color', 'w', 'FontWeight', 'bold');
+    end
+    
+    % Add information about Earth albedo
+    annotation('textbox', [0.15, 0.01, 0.7, 0.05], 'String', ...
+        {sprintf('Earth Albedo Coefficient: %.2f (%.0f%% of solar flux reflected from Earth)', ...
+        earthAlbedo, earthAlbedo*100)}, ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 10);
 end
